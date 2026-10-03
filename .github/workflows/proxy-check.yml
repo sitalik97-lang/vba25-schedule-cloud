@@ -20,7 +20,8 @@ jobs:
       - name: Download and parse public PDF only
         shell: python
         run: |
-          import tempfile, concurrent.futures
+          import tempfile, concurrent.futures, sys
+          sys.path.insert(0, ".")
           from pathlib import Path
           from source import HttpClient
           from updater import refresh_schedule
