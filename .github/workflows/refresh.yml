@@ -32,6 +32,7 @@ jobs:
           from updater import refresh_schedule
           from formatter import render_day
           from schedule_parser import flatten_days
+          from constants import PAIR_TIMES
           proxies = ['5.42.123.150:1080', '89.169.2.163:10808', '109.191.10.98:1080']
           for index, address in enumerate(proxies):
               client = HttpClient(attempts=1, timeout=15)
@@ -42,6 +43,7 @@ jobs:
                       result = refresh_schedule(client=client, schedule_path=Path(tmp)/'schedule.json', state_path=Path(tmp)/'state.json')
                       data = result['schedule']
                       payload = {'from': data['weeks'][0]['from'], 'to': data['weeks'][-1]['to'], 'checked_at': datetime.now(timezone.utc).isoformat(), 'days': {k: render_day(v) for k,v in flatten_days(data).items()}}
+                      payload['lessons'] = [{'subject': entry['subject'], 'subgroup': i, 'date': day['date'], 'pair': pair['number'], 'at': day['date']+'T'+PAIR_TIMES[pair['number']][0]+':00+03:00', 'teacher': entry.get('teacher',''), 'room': entry.get('room','')} for day in flatten_days(data).values() for pair in day.get('pairs',[]) if pair['number'] in PAIR_TIMES for i,entry in enumerate(pair['subgroups'],1) if entry.get('subject')]
                       Path('payload.json').write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
                       print('Timetable PDF parsed successfully; route', index + 1)
                       break
