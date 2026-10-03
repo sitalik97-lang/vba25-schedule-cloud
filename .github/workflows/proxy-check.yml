@@ -1,0 +1,43 @@
+name: Check public timetable proxy
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/proxy-check.yml']
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt 'requests[socks]'
+      - name: Download and parse public PDF only
+        shell: python
+        run: |
+          import tempfile, concurrent.futures
+          from pathlib import Path
+          from source import HttpClient
+          from updater import refresh_schedule
+          addresses = ['185.179.188.54:1080', '83.219.149.45:1080', '185.49.110.155:1080']
+          def check(address):
+              client = HttpClient(attempts=1, timeout=12)
+              client.session.trust_env = False
+              client.session.proxies = dict(http='socks5h://' + address, https='socks5h://' + address)
+              try:
+                  with tempfile.TemporaryDirectory() as tmp:
+                      result = refresh_schedule(client=client, schedule_path=Path(tmp)/'schedule.json', state_path=Path(tmp)/'state.json')
+                      return address, 'PDF_PARSED', len(result['schedule']['weeks'])
+              except Exception as exc:
+                  return address, type(exc).__name__
+          with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+              results = list(pool.map(check, addresses))
+          for result in results:
+              print(result)
+          if not any('PDF_PARSED' in result for result in results):
+              raise SystemExit(1)
