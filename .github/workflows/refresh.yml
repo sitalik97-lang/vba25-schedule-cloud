@@ -84,10 +84,15 @@ jobs:
                   token = json.load(response)['value']
               claims = json.loads(base64.urlsafe_b64decode(token.split('.')[1] + '==='))
               print('Identity metadata:', {k: claims.get(k) for k in ('iss','aud','repository','repository_id','ref','sub','event_name','workflow_ref')})
-              req = urllib.request.Request('https://vba25-schedule.sitalik97.workers.dev/schedule', data=raw, headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
+              req = urllib.request.Request('https://vba25-schedule.sitalik97.workers.dev/schedule', data=raw, headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'User-Agent': 'VBA25ScheduleBot/1.0'})
               with opener.open(req, timeout=30) as response:
                   assert response.status == 200
               print('Schedule published successfully.')
           except Exception as exc:
               print('Publication failed:', type(exc).__name__, 'HTTP status:', getattr(exc, 'code', None))
+              if hasattr(exc, 'read'):
+                  detail = exc.read(256).decode('utf-8', errors='replace')
+                  for secret in (locals().get('token', ''), os.environ.get('ACTIONS_ID_TOKEN_REQUEST_TOKEN', '')):
+                      if secret: detail = detail.replace(secret, '[redacted]')
+                  print('Response:', detail)
               raise SystemExit(1) from None
