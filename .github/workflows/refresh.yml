@@ -3,22 +3,89 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '17,47 * * * *'
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 concurrency:
   group: timetable-refresh
   cancel-in-progress: false
 jobs:
-  refresh:
+  download:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install -r requirements.txt
-      - run: python publish.py
-        env:
-          WORKER_URL: https://vba25-schedule.sitalik97.workers.dev
+      - run: pip install -r requirements.txt 'requests[socks]'
+      - name: Fetch public timetable with fallback proxies
+        shell: python
+        run: |
+          import sys, json, tempfile
+          from pathlib import Path
+          from datetime import datetime, timezone
+          sys.path.insert(0, '.')
+          from source import HttpClient
+          from updater import refresh_schedule
+          from formatter import render_day
+          from schedule_parser import flatten_days
+          proxies = ['5.42.123.150:1080', '89.169.2.163:10808', '109.191.10.98:1080']
+          for index, address in enumerate(proxies):
+              client = HttpClient(attempts=1, timeout=15)
+              client.session.trust_env = False
+              client.session.proxies = dict(http='socks5h://' + address, https='socks5h://' + address)
+              try:
+                  with tempfile.TemporaryDirectory() as tmp:
+                      result = refresh_schedule(client=client, schedule_path=Path(tmp)/'schedule.json', state_path=Path(tmp)/'state.json')
+                      data = result['schedule']
+                      payload = {'from': data['weeks'][0]['from'], 'to': data['weeks'][-1]['to'], 'checked_at': datetime.now(timezone.utc).isoformat(), 'days': {k: render_day(v) for k,v in flatten_days(data).items()}}
+                      Path('payload.json').write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+                      print('Timetable PDF parsed successfully; route', index + 1)
+                      break
+              except Exception as exc:
+                  print('Route unavailable:', index + 1, type(exc).__name__)
+          else:
+              print('All routes unavailable; previous cloud timetable retained.')
+              raise SystemExit(1)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: timetable-payload
+          path: payload.json
+          retention-days: 1
+          if-no-files-found: error
+  publish:
+    needs: download
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: timetable-payload
+      - name: Publish directly to Cloudflare
+        shell: python
+        run: |
+          import os, json, urllib.request, urllib.parse
+          from pathlib import Path
+          # This separate job receives no proxy configuration or bot token.
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+          try:
+              raw = Path('payload.json').read_bytes()
+              data = json.loads(raw)
+              assert len(raw) <= 200000 and data.get('days') and data.get('checked_at')
+              url = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=vba25-schedule-update'
+              req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+              with opener.open(req, timeout=20) as response:
+                  token = json.load(response)['value']
+              req = urllib.request.Request('https://vba25-schedule.sitalik97.workers.dev/schedule', data=raw, headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
+              with opener.open(req, timeout=30) as response:
+                  assert response.status == 200
+              print('Schedule published successfully.')
+          except Exception as exc:
+              print('Publication failed:', type(exc).__name__)
+              raise SystemExit(1) from None
