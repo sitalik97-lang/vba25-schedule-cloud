@@ -21,7 +21,12 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -r requirements.txt 'requests[socks]'
-      - name: Fetch public timetable with fallback proxies
+      - uses: actions/cache/restore@v4
+        with:
+          path: .proxy-state
+          key: proxy-health-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: proxy-health-v1-
+      - name: Fetch public timetable with ranked fallback proxies
         shell: python
         run: |
           import sys, json, tempfile
@@ -33,11 +38,64 @@ jobs:
           from formatter import render_day
           from schedule_parser import flatten_days
           from constants import PAIR_TIMES
-          proxies = ['5.42.123.150:1080', '89.169.2.163:10808', '109.191.10.98:1080']
-          for index, address in enumerate(proxies):
-              client = HttpClient(attempts=1, timeout=15)
+          import time, signal, ipaddress, requests
+          from urllib.parse import urlsplit
+          stats_path = Path('.proxy-state/results.json')
+          try:
+              stats = json.loads(stats_path.read_text())
+              if not isinstance(stats, dict): stats = {}
+          except (OSError, ValueError):
+              stats = {}
+          def valid_proxy(value):
+              try:
+                  u = urlsplit(value)
+                  return u.scheme in ('socks5h', 'socks4a', 'http') and not u.username and not u.password and not u.query and not u.fragment and u.path in ('', '/') and ipaddress.ip_address(u.hostname).is_global and 1 <= u.port <= 65535
+              except (ValueError, TypeError):
+                  return False
+          pool = ['socks5h://' + a for a in ['5.42.123.150:1080', '89.169.2.163:10808', '109.191.10.98:1080']]
+          session = requests.Session()
+          session.trust_env = False
+          try:
+              response = session.get('https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/RU/data.txt', timeout=(5, 8))
+              response.raise_for_status()
+              if len(response.content) > 200000: raise ValueError('List too large')
+              for line in response.text.splitlines():
+                  route = line.strip().replace('socks5://', 'socks5h://').replace('socks4://', 'socks4a://')
+                  if valid_proxy(route): pool.append(route)
+          except Exception as exc:
+              print('Proxy list unavailable:', type(exc).__name__)
+          pool = list(dict.fromkeys([p for p in stats if valid_proxy(p)] + pool))[:300]
+          pool.insert(0, 'direct')
+          stats = {p: v for p, v in stats.items() if p in pool and isinstance(v, dict) and isinstance(v.get('history', []), list) and all(x in (0,1) for x in v.get('history', [])) and isinstance(v.get('last', 0), (int,float))}
+          def rank(route):
+              h = stats.get(route, {}).get('history', [])[-12:]
+              rate = sum(h) / len(h) if h else 0
+              # Recent failures demote a once-good route. Least recently tried breaks ties.
+              streak = 0
+              for result in reversed(h):
+                  if result: break
+                  streak += 1
+              score = rate / (1 + streak)
+              return (-score, stats.get(route, {}).get('last', 0))
+          def record(route, ok):
+              old = stats.get(route, {}).get('history', [])
+              stats[route] = {'history': (old + [int(ok)])[-12:], 'last': time.time()}
+              stats_path.parent.mkdir(exist_ok=True)
+              stats_path.write_text(json.dumps(stats))
+          def expired(signum, frame):
+              raise TimeoutError('Route budget exceeded')
+          signal.signal(signal.SIGALRM, expired)
+          proxies = sorted(pool, key=rank)
+          print('Available routes:', len(proxies))
+          deadline = time.monotonic() + 210
+          success = False
+          for index, address in enumerate(proxies[:25]):
+              remaining = int(deadline - time.monotonic())
+              if remaining < 5: break
+              client = HttpClient(attempts=1, timeout=(4, 10))
               client.session.trust_env = False
-              client.session.proxies = dict(http='socks5h://' + address, https='socks5h://' + address)
+              client.session.proxies = {} if address == 'direct' else dict(http=address, https=address)
+              signal.alarm(min(45, remaining))
               try:
                   with tempfile.TemporaryDirectory() as tmp:
                       result = refresh_schedule(client=client, schedule_path=Path(tmp)/'schedule.json', state_path=Path(tmp)/'state.json')
@@ -45,13 +103,24 @@ jobs:
                       payload = {'from': data['weeks'][0]['from'], 'to': data['weeks'][-1]['to'], 'checked_at': datetime.now(timezone.utc).isoformat(), 'days': {k: render_day(v) for k,v in flatten_days(data).items()}}
                       payload['lessons'] = [{'subject': entry['subject'], 'subgroup': i, 'date': day['date'], 'pair': pair['number'], 'at': day['date']+'T'+PAIR_TIMES[pair['number']][0]+':00+03:00', 'teacher': entry.get('teacher',''), 'room': entry.get('room','')} for day in flatten_days(data).values() for pair in day.get('pairs',[]) if pair['number'] in PAIR_TIMES for i,entry in enumerate(pair['subgroups'],1) if entry.get('subject')]
                       Path('payload.json').write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+                      record(address, True)
+                      success = True
                       print('Timetable PDF parsed successfully; route', index + 1)
                       break
               except Exception as exc:
+                  record(address, False)
                   print('Route unavailable:', index + 1, type(exc).__name__)
-          else:
+              finally:
+                  signal.alarm(0)
+                  client.session.close()
+          if not success:
               print('All routes unavailable; previous cloud timetable retained.')
               raise SystemExit(1)
+      - uses: actions/cache/save@v4
+        if: always() && hashFiles('.proxy-state/results.json') != ''
+        with:
+          path: .proxy-state
+          key: proxy-health-v1-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-artifact@v4
         with:
           name: timetable-payload
