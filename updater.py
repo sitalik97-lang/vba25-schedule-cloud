@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
@@ -93,36 +93,47 @@ def refresh_schedule(
         if not candidate:
             raise RuntimeError(f"На странице не найден файл для группы {stable_group}")
 
-        response = client.get(candidate.url)
-        pdf_bytes = response.content
-        if not pdf_bytes:
-            raise RuntimeError("Файл расписания скачался пустым")
-
-        digest = sha256_bytes(pdf_bytes)
-        unchanged = digest == state.get("file_sha256") and schedule_path.exists()
-
-        # Even if the file is unchanged, update freshness/status metadata.
-        if unchanged:
-            state.update({
-                "ok": True,
-                "last_success": _utc_now(),
-                "last_error": None,
-                "candidate": asdict(candidate),
-                "file_sha256": digest,
-                "changed": False,
-            })
-            save_state(state_path, state)
-            return {"changed": False, "candidate": candidate, "schedule": None, "state": state}
-
-        with tempfile.NamedTemporaryFile("wb", suffix=".pdf", delete=False) as tmp:
-            tmp.write(pdf_bytes)
-            pdf_path = Path(tmp.name)
-        try:
-            schedule = parse_pdf(pdf_path)
-        finally:
-            pdf_path.unlink(missing_ok=True)
-
+        # Include every published period selected over the next month, not just today.
+        selected = {candidate.url: candidate}
+        for offset in range(1, 31):
+            item = choose_candidate(candidates, target + timedelta(days=offset))
+            if item:
+                selected.setdefault(item.url, item)
+        if len(selected) > 8:
+            raise ValueError("Too many timetable files in the requested window")
+        parts, manifest = [], []
+        for item in selected.values():
+            pdf_bytes = client.get(item.url).content
+            if not pdf_bytes:
+                raise RuntimeError("Файл расписания скачался пустым")
+            manifest.append([item.url, sha256_bytes(pdf_bytes)])
+            with tempfile.NamedTemporaryFile("wb", suffix=".pdf", delete=False) as tmp:
+                tmp.write(pdf_bytes)
+                pdf_path = Path(tmp.name)
+            try:
+                part = parse_pdf(pdf_path)
+            finally:
+                pdf_path.unlink(missing_ok=True)
+            validate_schedule(part, stable_group)
+            parts.append(part)
+        # A failed future PDF must not replace the saved schedule with partial data.
+        digest = sha256_bytes(json.dumps(manifest, ensure_ascii=False).encode("utf-8"))
+        seen_dates, weeks = set(), []
+        for part in parts:
+            for week in part["weeks"]:
+                days = [day for day in week["days"] if day["date"] not in seen_dates]
+                seen_dates.update(day["date"] for day in days)
+                if days:
+                    weeks.append({**week, "days": days})
+        weeks.sort(key=lambda week: (week["from"], week["to"]))
+        schedule = {**parts[0], "weeks": weeks, "sources": [asdict(item) for item in selected.values()]}
         validate_schedule(schedule, stable_group)
+        unchanged = digest == state.get("file_sha256") and schedule_path.exists()
+        if unchanged:
+            state.update({"ok": True, "last_success": _utc_now(), "last_error": None,
+                          "candidate": asdict(candidate), "file_sha256": digest, "changed": False})
+            save_state(state_path, state)
+            return {"changed": False, "candidate": candidate, "schedule": schedule, "state": state}
 
         # The temp file name is meaningless to users; record the source label/url.
         schedule["source_file"] = candidate.label or Path(candidate.url).name
