@@ -96,6 +96,24 @@ def _parse_day(rows: list[list[str | None]], date, day_index: int) -> dict[str, 
     }
 
 
+def _day_date(value, start, end, index):
+    # Rotated labels are extracted bottom-to-top, with punctuation attached to digits.
+    variants = (_compact(value), _compact("".join(reversed((value or "").splitlines()))))
+    for text in variants:
+        match = re.search(r"(?<!\d)(\d{2})\.(\d{2})\.(\d{4})(?!\d)", text)
+        if match:
+            day, month, year = map(int, match.groups())
+            actual = datetime(year, month, day).date()
+            if not start <= actual <= end:
+                raise ValueError("Day label outside declared timetable period")
+            return actual
+    # Legacy one-week tables may have weekday-only labels. Never guess within a
+    # multi-week period: that silently puts the second page on the first week.
+    if (end - start).days >= 7:
+        raise ValueError("Explicit day dates required for a multi-week timetable")
+    return start + timedelta(days=index)
+
+
 def parse_pdf(path: str | Path) -> dict[str, Any]:
     """Parse a timetable PDF.
 
@@ -105,6 +123,7 @@ def parse_pdf(path: str | Path) -> dict[str, Any]:
     path = Path(path)
     result: dict[str, Any] = {"source_file": path.name, "weeks": []}
 
+    seen_dates = set()
     with pdfplumber.open(path) as pdf:
         for page_number, page in enumerate(pdf.pages, 1):
             tables = page.find_tables(table_settings={
@@ -128,11 +147,14 @@ def parse_pdf(path: str | Path) -> dict[str, Any]:
             days = []
             for di, start_idx in enumerate(starts):
                 stop_idx = starts[di + 1] if di + 1 < len(starts) else len(rows)
-                date = start + timedelta(days=di)
+                date = _day_date(rows[start_idx][0], start, end, di)
                 # Do not manufacture days outside the page period.
                 if date > end:
                     break
-                days.append(_parse_day(rows[start_idx:stop_idx], date, di))
+                if date in seen_dates:
+                    raise ValueError("Duplicate day in timetable PDF")
+                seen_dates.add(date)
+                days.append(_parse_day(rows[start_idx:stop_idx], date, date.weekday()))
 
             result["weeks"].append({
                 "page": page_number,
