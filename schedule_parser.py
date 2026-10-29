@@ -98,7 +98,7 @@ def _parse_day(rows: list[list[str | None]], date, day_index: int) -> dict[str, 
 
 def _day_date(value, start, end, index):
     # Rotated labels are extracted bottom-to-top, with punctuation attached to digits.
-    variants = (_compact(value), _compact("".join(reversed((value or "").splitlines()))))
+    variants = (_compact(value), _compact("".join(reversed((value or "").splitlines()))), _compact(value)[::-1])
     for text in variants:
         match = re.search(r"(?<!\d)(\d{2})\.(\d{2})\.(\d{4})(?!\d)", text)
         if match:
