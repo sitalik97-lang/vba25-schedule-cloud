@@ -64,7 +64,9 @@ jobs:
                   if valid_proxy(route): pool.append(route)
           except Exception as exc:
               print('Proxy list unavailable:', type(exc).__name__)
-          pool = list(dict.fromkeys([p for p in stats if valid_proxy(p)] + pool))[:300]
+          fresh = list(dict.fromkeys(pool))
+          known = sorted([p for p in stats if valid_proxy(p) and isinstance(stats[p], dict) and isinstance(stats[p].get('last', 0), (int, float))], key=lambda p: stats[p].get('last', 0), reverse=True)
+          pool = list(dict.fromkeys(fresh[:150] + known[:150]))
           pool.insert(0, 'direct')
           stats = {p: v for p, v in stats.items() if p in pool and isinstance(v, dict) and isinstance(v.get('history', []), list) and all(x in (0,1) for x in v.get('history', [])) and isinstance(v.get('last', 0), (int,float))}
           def rank(route):
@@ -85,7 +87,7 @@ jobs:
           def expired(signum, frame):
               raise TimeoutError('Route budget exceeded')
           signal.signal(signal.SIGALRM, expired)
-          proxies = sorted(pool, key=rank)
+          proxies = ['direct'] + sorted([p for p in pool if p != 'direct'], key=rank)
           print('Available routes:', len(proxies))
           deadline = time.monotonic() + 210
           success = False
@@ -109,7 +111,9 @@ jobs:
                       break
               except Exception as exc:
                   record(address, False)
-                  print('Route unavailable:', index + 1, type(exc).__name__)
+                  print('Route unavailable:', index + 1, 'direct' if address == 'direct' else 'proxy', type(exc).__name__)
+                  if isinstance(exc, ValueError):
+                      print('Timetable validation:', str(exc)[:180])
               finally:
                   signal.alarm(0)
                   client.session.close()
